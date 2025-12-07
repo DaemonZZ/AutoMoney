@@ -1,13 +1,12 @@
 # api/market_data.py (chỉ phần liên quan, giả sử các hàm _to_ms, _parse_kline, get_klines đã có)
 
-from datetime import timedelta, timezone
 from binance.client import Client
 
 from data.kline import Kline
 from data.kline_parser import parse_kline
 from data.range_4h_ny import Range4HNY
 from .binance_client import get_client
-from core.time_utils import trading_midnight, to_utc
+from core.time_utils import trading_midnight
 from config import DEFAULT_SYMBOL, VN_TZ
 from config import TRADING_TIMEZONE
 from datetime import datetime, timedelta, timezone

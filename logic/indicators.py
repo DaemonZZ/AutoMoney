@@ -1,80 +1,65 @@
 # logic/indicators.py
-
 from __future__ import annotations
-from typing import List, Optional
-from data.kline import Kline
+
+from typing import List, Sequence
+
+from .models import SimpleKline
 
 
-def ema(values: List[float], period: int) -> List[Optional[float]]:
+def ema(values: Sequence[float], period: int) -> List[float]:
     """
-    Tính EMA cho list giá.
-    Trả về list cùng chiều, những phần tử đầu chưa đủ period sẽ là None.
+    Tính EMA đơn giản, trả về list cùng length với input.
     """
-    if not values or period <= 0:
-        return [None] * len(values)
+    values = list(values)
+    if not values:
+        return []
 
-    ema_values: List[Optional[float]] = [None] * len(values)
+    if period <= 1:
+        # EMA(1) = giá trị gốc
+        return values.copy()
 
-    # khởi tạo bằng SMA
-    if len(values) < period:
-        return ema_values
+    alpha = 2.0 / (period + 1.0)
+    out: List[float] = [values[0]]
 
-    sma = sum(values[:period]) / period
-    ema_values[period - 1] = sma
+    for v in values[1:]:
+        prev = out[-1]
+        out.append(prev + alpha * (v - prev))
 
-    k = 2 / (period + 1)
-
-    prev = sma
-    for i in range(period, len(values)):
-        price = values[i]
-        prev = price * k + prev * (1 - k)
-        ema_values[i] = prev
-
-    return ema_values
+    return out
 
 
-def atr(candles: List[Kline], period: int) -> List[Optional[float]]:
+def compute_atr(candles: Sequence[SimpleKline], length: int) -> List[float]:
     """
-    Tính ATR (Average True Range) cho list Kline.
-    Trả về list cùng chiều, những phần tử đầu chưa đủ period sẽ là None.
-    True Range = max(
-        high - low,
-        abs(high - prev_close),
-        abs(low - prev_close)
-    )
+    ATR dạng EMA (smoothed)
     """
+    candles = list(candles)
     n = len(candles)
-    if n == 0 or period <= 0:
-        return [None] * n
+    if n == 0:
+        return []
 
-    trs: List[float] = [0.0] * n
+    if n == 1 or length <= 0:
+        return [0.0] * n
 
-    for i, c in enumerate(candles):
-        high = c.high
-        low = c.low
-        if i == 0:
-            trs[i] = high - low
-        else:
-            prev_close = candles[i - 1].close
-            trs[i] = max(
-                high - low,
-                abs(high - prev_close),
-                abs(low - prev_close),
-            )
+    trs: List[float] = []
+    for i in range(1, n):
+        high = candles[i].high
+        low = candles[i].low
+        prev_close = candles[i - 1].close
+        tr = max(
+            high - low,
+            abs(high - prev_close),
+            abs(low - prev_close),
+        )
+        trs.append(tr)
 
-    atr_values: List[Optional[float]] = [None] * n
+    # ATR smoothing (EMA kiểu đơn giản)
+    atr: List[float] = []
+    alpha = 1.0 / float(length)
+    atr.append(trs[0])
+    for t in trs[1:]:
+        prev = atr[-1]
+        atr.append(prev + alpha * (t - prev))
 
-    if n < period:
-        return atr_values
-
-    first_atr = sum(trs[:period]) / period
-    atr_values[period - 1] = first_atr
-
-    for i in range(period, n):
-        prev = atr_values[i - 1]
-        tr = trs[i]
-        # ATR kiểu Wilder
-        curr = (prev * (period - 1) + tr) / period
-        atr_values[i] = curr
-
-    return atr_values
+    out = [0.0] * n
+    out[1:] = atr
+    return out

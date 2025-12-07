@@ -1,170 +1,108 @@
-# test_multi_coin_v4_pro_auto.py
+"""
+Test skeleton cho EMA_PULLBACK_V4_PRO
+- Load data
+- Chạy backtest
+- In kết quả
+- Optional: chạy optimizer trước khi backtest
+"""
 
 from datetime import datetime, timedelta, timezone
+from typing import List
 
 from api.market_data_futures import get_futures_klines
-from logic.backtest_ema_pullback_v4_pro import backtest_ema_pullback_v4_pro
-from logic.optimizer_v4_pro import (
-    ParamSearchSpaceV4Pro,
-    auto_optimize_params_v4_pro,
-)
+from logic.strategies.v4_pro_params import EmaPullbackParams
+from logic.strategies.backtest_ema_pullback_v4_pro import backtest_ema_pullback_v4_pro
+from logic.optimizers.optimizer_v4_pro import optimize_v4_pro_for_symbol
 
 
-SYMBOLS = [
-    "BTCUSDT",
-    "ETHUSDT",
-    "BNBUSDT",
-    "SOLUSDT",
-    "XRPUSDT",
-    "ADAUSDT",
-    "DOGEUSDT",
-    "AVAXUSDT",
-    "TRXUSDT",
-    "DOTUSDT",
-    "LINKUSDT",
-    "ZECUSDT",
-]
-
+# ==========================================
+# CONFIG
+# ==========================================
+SYMBOL = "BTCUSDT"
 INTERVAL = "5m"
-DAYS = 60          # anh có thể đổi 20 / 30 / 90 tuỳ ý
-MIN_TRADES = 200   # tránh overfit kiểu 30-40 lệnh
+DAYS = 20
+USE_OPTIMIZER = False     # bật/tắt tùy ý
 
 
-def _interval_to_timedelta(interval: str) -> timedelta:
-    unit = interval[-1]
-    value = int(interval[:-1])
-    if unit == "m":
-        return timedelta(minutes=value)
-    if unit == "h":
-        return timedelta(hours=value)
-    if unit == "d":
-        return timedelta(days=value)
-    if unit == "w":
-        return timedelta(weeks=value)
-    return timedelta(minutes=value)
-
-
-def fetch_recent_futures_klines_by_days(
-    symbol: str,
-    interval: str,
-    days: int,
-    limit_per_call: int = 1500,
-):
-    now_utc = datetime.now(timezone.utc)
-    end = now_utc
+# ==========================================
+# TẢI DATA
+# ==========================================
+def fetch_klines_multi_days(symbol: str, interval: str, days: int):
+    end = datetime.now(timezone.utc)
     start = end - timedelta(days=days)
-    print(
-        f"[INFO] Fetching klines (multi-days) {symbol} {interval}, "
-        f"from {start} to {end}"
+
+    print(f"[INFO] Fetching klines: {symbol}, {interval}, {days} days")
+    print(f"       From {start.isoformat()} To {end.isoformat()}")
+
+    data = get_futures_klines(
+        symbol=symbol,
+        interval=interval,
+        start_time=start,
+        end_time=end,
+        limit=1500
     )
 
-    all_klines = []
-    current_start = start
-    interval_delta = _interval_to_timedelta(interval)
-
-    while True:
-        batch = get_futures_klines(
-            symbol=symbol,
-            interval=interval,
-            start_time=current_start,
-            end_time=end,
-            limit=limit_per_call,
-        )
-        if not batch:
-            break
-
-        all_klines.extend(batch)
-
-        if len(batch) < limit_per_call:
-            break
-
-        last_open = batch[-1].open_time
-        next_start = last_open + interval_delta
-        if next_start >= end:
-            break
-        current_start = next_start
-
-    print(f"[INFO] {symbol}: tổng số nến lấy được: {len(all_klines)}")
-    return all_klines
+    print(f"[INFO] Total candles loaded: {len(data)}")
+    return data
 
 
-def build_default_search_space() -> ParamSearchSpaceV4Pro:
-    """
-    Search space nhỏ, an toàn – anh có thể chỉnh lại sau khi xem performance.
-    """
-    return ParamSearchSpaceV4Pro(
-        ema_fast_list=[14, 18, 21],
-        ema_slow_list=[150, 200],
-        atr_period_list=[10, 14],
-        r_multiple_list=[1.8, 2.0, 2.2],
-        min_trend_strength_list=[0.0],   # có thể thêm [0.0, 50.0] để test
-        max_pullback_ratio_list=[0.5],   # để nguyên 0.5 như V4 Pro
-    )
+# ==========================================
+# PRINT TRADE SUMMARY
+# ==========================================
+def summarize_trades(trades):
+    wins = [t for t in trades if t.result_r > 0]
+    loss = [t for t in trades if t.result_r < 0]
+    be = [t for t in trades if t.result_r == 0]
+
+    total = len(trades)
+    wr = (len(wins) / total * 100) if total > 0 else 0
+
+    print("\n============== SUMMARY ==============")
+    print(f"Total trades   : {total}")
+    print(f"  Wins         : {len(wins)}")
+    print(f"  Loss         : {len(loss)}")
+    print(f"  BE (0R)      : {len(be)}")
+    print(f"Winrate        : {wr:.2f}%")
+    print("====================================\n")
 
 
+# ==========================================
+# MAIN RUN
+# ==========================================
 def main():
-    print("=== EMA_PULLBACK_V4 Pro - Multi-coin Auto Optimizer ===")
+    print("\n=========== EMA_PULLBACK_V4_PRO TEST ===========")
 
-    space = build_default_search_space()
-    summary = []
+    # Step 1: load data
+    klines = fetch_klines_multi_days(SYMBOL, INTERVAL, DAYS)
 
-    for idx, sym in enumerate(SYMBOLS, start=1):
-        print(f"\n================ {idx}/{len(SYMBOLS)} - {sym} ================")
+    # Step 2: load params (optimize hoặc default)
+    if USE_OPTIMIZER:
+        print(f"[INFO] Optimizing parameters for: {SYMBOL}")
+        params = optimize_v4_pro_for_symbol(SYMBOL)
+    else:
+        params = EmaPullbackParams()
 
-        klines = fetch_recent_futures_klines_by_days(sym, INTERVAL, DAYS)
-        if not klines:
-            print(f"[WARN] Không có data cho {sym}, bỏ qua.")
-            continue
+    print("\n=== PARAMETERS USED ===")
+    print(params)
 
-        opt = auto_optimize_params_v4_pro(
-            klines,
-            symbol=sym,
-            interval=INTERVAL,
-            space=space,
-            min_trades=MIN_TRADES,
-        )
-        if opt is None:
-            print(f"[WARN] Không tìm được param phù hợp cho {sym}, bỏ qua.")
-            continue
+    # Step 3: run backtest
+    print("\n[INFO] Running backtest...")
+    trades, candles, ema_fast, ema_slow, atr = backtest_ema_pullback_v4_pro(
+        klines,
+        params,
+        symbol=SYMBOL,
+        interval=INTERVAL,
+    )
 
-        p = opt.best_params
-        print(
-            f"[OPT-RESULT] {sym}: EF={p.ema_fast}, ES={p.ema_slow}, "
-            f"ATR={p.atr_period}, R={p.r_multiple}, "
-            f"TS={p.min_trend_strength}, PB={p.max_pullback_ratio}"
-        )
-        print(
-            f"[OPT-RESULT] {sym}: Trades={opt.trades}, Wins={opt.wins}, "
-            f"Loss={opt.loss}, BE={opt.be}, WR={opt.winrate:.2f}%, "
-            f"ExpR={opt.exp_r:.3f}"
-        )
+    # Step 4: summary
+    summarize_trades(trades)
 
-        # Nếu anh muốn, có thể backtest lại 1 lần nữa với best_params,
-        # nhưng thực ra opt đã chạy backtest rồi, nên thường không cần.
-        summary.append(
-            (
-                sym,
-                opt.trades,
-                opt.wins,
-                opt.loss,
-                opt.be,
-                opt.winrate,
-                opt.exp_r,
-                p,
-            )
-        )
+    # Step 5: optional print first few trades
+    print("=== SAMPLE TRADES ===")
+    for t in trades[:5]:
+        print(t)
 
-    # In tổng kết
-    print("\n===============================================")
-    print("                 TỔNG KẾT 12 COIN             ")
-    print("===============================================")
-    print(f"{'Symbol':<8} {'Trades':>7} {'Wins':>7} {'Loss':>7} {'BE':>5} {'WR %':>7} {'ExpR':>7}")
-    print("-" * 65)
-    for sym, n, wins, loss, be, wr, exp_r, p in summary:
-        print(
-            f"{sym:<8} {n:>7} {wins:>7} {loss:>7} {be:>5} "
-            f"{wr:>7.2f} {exp_r:>7.3f}"
-        )
+    print("\n[TEST COMPLETED]")
 
 
 if __name__ == "__main__":

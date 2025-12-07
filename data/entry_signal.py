@@ -1,6 +1,5 @@
 from dataclasses import dataclass
 from datetime import datetime
-from data.kline import Kline
 from data.break_event import BreakEvent
 
 @dataclass

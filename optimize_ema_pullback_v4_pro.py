@@ -14,9 +14,9 @@ from typing import List, Dict, Any
 from datetime import datetime, timedelta, timezone
 
 from api.market_data_futures import get_futures_klines
-from logic.backtest_ema_pullback_v4_pro import (
+from logic.strategies import (
     BacktestParamsV4Pro,
-    backtest_ema_pullback_v4_pro,
+    ema_pullback_v4_pro,
 )
 
 # ================== CẤU HÌNH CHUNG ==================

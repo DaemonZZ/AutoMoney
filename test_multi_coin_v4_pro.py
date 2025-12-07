@@ -7,14 +7,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import List, Dict, Tuple
+from typing import List
 
 from api.market_data_futures import get_futures_klines
-from logic.backtest_ema_pullback_v4_pro import (
-    backtest_ema_pullback_v4_pro,
-    BacktestParamsV4Pro,
-    TradeResult,
-)
+from logic.models import TradeResult
+from logic.strategies.ema_pullback_v4_pro import EmaPullbackParams, backtest_ema_pullback_v4_pro
 
 # ================= CẤU HÌNH BACKTEST =================
 
@@ -45,7 +42,7 @@ SYMBOLS = [
 ]
 
 # Tham số chiến lược V4 Pro – dùng chung cho tất cả coin
-DEFAULT_PARAMS = BacktestParamsV4Pro(
+DEFAULT_PARAMS = EmaPullbackParams(
     ema_fast=21,
     ema_slow=200,
     atr_period=14,

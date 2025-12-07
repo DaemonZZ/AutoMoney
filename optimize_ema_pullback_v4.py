@@ -10,12 +10,12 @@ Auto-optimizer cho EMA_PULLBACK_V4 Pro:
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List, Tuple, Dict, Any
+from typing import List, Dict, Any
 from datetime import datetime, timedelta, timezone
 
 from api.market_data_futures import get_futures_klines  # dùng bản đang chạy OK với multi-coin
-from logic.backtest_ema_pullback_v4_pro import (
-    backtest_ema_pullback_v4_pro,
+from logic.strategies import (
+    ema_pullback_v4_pro,
     BacktestParamsV4Pro,  # nếu tên class khác, đổi lại ở đây
 )
 
