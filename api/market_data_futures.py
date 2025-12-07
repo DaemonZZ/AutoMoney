@@ -4,9 +4,9 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 from typing import Optional
-
+from .binance_client import client_futures
 from binance.client import Client
-
+import time
 from data.kline import Kline
 from data.kline_parser import parse_kline
 from data.range_4h_ny import Range4HNY
@@ -184,3 +184,68 @@ def get_5m_candles_from_4h_to_now_newyork_futures(
             filtered.append(c)
 
     return filtered
+
+def fetch_recent_futures_klines_by_days(symbol: str, interval: str, days: int):
+    """
+    Fetch lịch sử futures nhiều ngày, theo batch để tránh lỗi limit.
+    Mỗi batch tối đa 1500 nến.
+
+    Trả về list raw klines.
+    """
+
+    limit = 1500  # Binance max limit
+    ms_per_candle = interval_to_ms(interval)
+
+    end = datetime.now(timezone.utc)
+    start = end - timedelta(days=days)
+
+    start_ms = int(start.timestamp() * 1000)
+    end_ms = int(end.timestamp() * 1000)
+
+    all_klines = []
+
+    while start_ms < end_ms:
+        params = {
+            "symbol": symbol.upper(),
+            "interval": interval,
+            "startTime": start_ms,
+            "endTime": end_ms,
+            "limit": limit
+        }
+
+        # CALL API
+        try:
+            chunk = client_futures.futures_klines(**params)
+        except Exception as e:
+            print(f"[ERROR] fetch {symbol}: {e}")
+            break
+
+        if not chunk:
+            break
+
+        all_klines.extend(chunk)
+
+        # next start = last candle close time + 1ms
+        last_close = chunk[-1][6]  # closeTime
+        start_ms = last_close + 1
+
+        time.sleep(0.25)  # tránh bị ban
+
+    return all_klines
+
+
+# ---------------------------------------------------------
+# Helper: convert interval (e.g. "5m") -> milliseconds
+# ---------------------------------------------------------
+def interval_to_ms(interval: str) -> int:
+    unit = interval[-1]
+    num = int(interval[:-1])
+
+    if unit == "m":
+        return num * 60 * 1000
+    if unit == "h":
+        return num * 60 * 60 * 1000
+    if unit == "d":
+        return num * 24 * 60 * 60 * 1000
+
+    raise ValueError(f"Interval not supported: {interval}")

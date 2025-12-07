@@ -1,35 +1,39 @@
-# strategy/ema_pullback_v2.py
+# logic/ema_pullback_v2.py
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from enum import Enum
-from typing import List
 from datetime import datetime
+from typing import Optional, Literal
 
 
-# =========================
-#   ENUM & DATA CLASSES
-# =========================
-
-class Side(str, Enum):
-    LONG = "LONG"
-    SHORT = "SHORT"
-
-
-class TrendSide(str, Enum):
-    UP = "UP"
-    DOWN = "DOWN"
-    NONE = "NONE"
+Side = Literal["LONG", "SHORT"]
+Outcome = Literal["WIN", "LOSS", "OPEN"]
 
 
 @dataclass
-class CandleWithInd:
+class EmaPullbackParams:
     """
-    1 nến 5m kèm indicator đã tính sẵn:
-    - ema_fast: EMA nhanh (VD: 21)
-    - ema_slow: EMA chậm (VD: 200)
-    - atr     : ATR (VD: 14)
+    Tham số cho chiến lược EMA_PULLBACK_V2
+    """
+    ema_fast_period: int = 21
+    ema_slow_period: int = 200
+    atr_period: int = 14
+
+    # dùng ATR để đặt SL/TP
+    atr_mult_sl: float = 1.0        # khoảng cách SL = atr_mult_sl * ATR
+    rr: float = 2.0                 # R:R = rr:1  (TP = entry + rr * risk)
+
+    # giờ trade theo múi giờ New York (int 0..23)
+    session_start_hour_ny: int = 4
+    session_end_hour_ny: int = 20   # inclusive: 4h -> 20h
+
+
+@dataclass
+class Candle:
+    """
+    Candle đơn giản dùng cho backtest.
+    open_time luôn hiểu là UTC.
     """
     open_time: datetime
     open: float
@@ -37,393 +41,132 @@ class CandleWithInd:
     low: float
     close: float
 
+
+@dataclass
+class EmaPullbackEntry:
+    """
+    Thông tin entry (chưa tính kết quả TP/SL).
+    """
+    symbol: str
+    index: int
+    side: Side
+    entry_time: datetime          # UTC
+    entry_price: float
+    sl: float
+    tp: float
+    risk_pts: float              # |entry - SL|
+    planned_rr: float            # thường = params.rr
+
     ema_fast: float
     ema_slow: float
     atr: float
 
 
 @dataclass
-class EntrySignal:
+class BacktestTrade:
     """
-    Thông tin 1 lệnh entry được sinh ra bởi strategy.
-        - index      : index của candle trong list candles
-        - side       : LONG / SHORT
-        - trend_side : UP / DOWN
-        - entry_price, sl, tp
-        - risk_pts   : khoảng cách entry -> SL (dương)
-        - rr         : R-multiple mục tiêu (thường 2.0)
+    Kết quả 1 lệnh sau khi backtest.
     """
-    index: int
-    side: Side
-    trend_side: TrendSide
-
-    entry_price: float
-    sl: float
-    tp: float
-    risk_pts: float
-    rr: float
+    entry: EmaPullbackEntry
+    outcome: Outcome    # WIN / LOSS / OPEN (chưa hit TP/SL)
+    r: float            # TP full: +rr, SL full: -1, OPEN: 0
+    exit_time: Optional[datetime] = None
+    exit_price: Optional[float] = None
+    exit_reason: Optional[str] = None  # "TP"/"SL"/"OPEN"
 
 
-@dataclass
-class EmaPullbackParams:
-    """
-    Tham số tinh chỉnh chiến lược EMA Pullback v2
-    """
-
-    # Cấu hình EMA / ATR (để bạn backtest cho đồng nhất)
-    ema_fast_period: int = 21
-    ema_slow_period: int = 200
-    atr_period: int = 14
-
-    # Take profit theo R-multiple (TP = entry ± R * risk)
-    r_mult: float = 2.0
-
-    # Dùng ATR buffer cho SL (đẩy SL ra xa thêm chút so với đáy/đỉnh pullback)
-    use_atr_buffer: bool = True
-    atr_buffer_mult: float = 0.3
-
-    # --- Trend filter ---
-
-    # Khoảng cách tối thiểu giữa EMA nhanh & chậm (tính theo ATR)
-    # VD: min_trend_ema_distance_atr = 0.5 nghĩa là:
-    #   |ema_fast - ema_slow| >= 0.5 * ATR
-    min_trend_ema_distance_atr: float = 0.5
-
-    # Số bar tối thiểu trend phải giữ (UP/DOWN liên tục) trước khi trade
-    min_trend_bars: int = 5
-
-    # --- Pullback config ---
-
-    # Số bar pullback tối thiểu & tối đa
-    min_pullback_bars: int = 2
-    max_pullback_bars: int = 10
-
-    # Độ sâu pullback tính theo ATR:
-    #   - Uptrend: depth = (swing_high - pullback_low) / ATR_entry
-    #   - Downtrend: depth = (pullback_high - swing_low) / ATR_entry
-    # depth phải nằm trong [min_pullback_depth_atr, max_pullback_depth_atr]
-    min_pullback_depth_atr: float = 0.5
-    max_pullback_depth_atr: float = 2.5
-
-    # Không cho phép entry quá xa EMA nhanh (tránh đu FOMO)
-    # Khoảng cách tối đa: max_entry_distance_from_ema_atr * ATR
-    max_entry_distance_from_ema_atr: float = 0.7
-
-    # Số pullback tối đa được trade trong 1 trend (0 = không giới hạn)
-    max_pullbacks_per_trend: int = 3
+def _is_trend_up(ema_fast: float, ema_slow: float) -> bool:
+    return ema_fast > ema_slow
 
 
-# =========================
-#   CORE LOGIC
-# =========================
-
-def _detect_trend(c: CandleWithInd, params: EmaPullbackParams) -> TrendSide:
-    """
-    Xác định trend tức thời dựa vào EMA nhanh & chậm + ATR.
-
-    - Trend UP khi:
-        ema_fast > ema_slow
-        và (ema_fast - ema_slow) >= min_trend_ema_distance_atr * ATR
-
-    - Trend DOWN khi ngược lại.
-    - Nếu không đủ “độ dốc” thì trả về NONE.
-    """
-    if c.atr <= 0:
-        return TrendSide.NONE
-
-    diff = c.ema_fast - c.ema_slow
-    threshold = params.min_trend_ema_distance_atr * c.atr
-
-    if diff >= threshold:
-        return TrendSide.UP
-    elif -diff >= threshold:
-        return TrendSide.DOWN
-    else:
-        return TrendSide.NONE
+def _is_trend_down(ema_fast: float, ema_slow: float) -> bool:
+    return ema_fast < ema_slow
 
 
-def find_ema_pullback_entries_v2(
-    candles: List[CandleWithInd],
+def find_ema_pullback_entry(
+    symbol: str,
+    candles: list[Candle],
+    i: int,
+    ema_fast_list: list[Optional[float]],
+    ema_slow_list: list[Optional[float]],
+    atr_list: list[Optional[float]],
     params: EmaPullbackParams,
-) -> List[EntrySignal]:
+) -> Optional[EmaPullbackEntry]:
     """
-    Chiến lược EMA Pullback v2:
+    Tìm tín hiệu entry tại index i.
+    Logic đơn giản, rõ ràng, dễ debug:
 
-    1) Xác định trend bằng EMA21 vs EMA200 + ATR:
-        - UP  : ema_fast > ema_slow & cách nhau >= min_trend_ema_distance_atr * ATR
-        - DOWN: ema_fast < ema_slow & cách nhau >= min_trend_ema_distance_atr * ATR
+    - Xu hướng UP: EMA_FAST > EMA_SLOW
+        LONG khi:
+            + giá đóng cửa C[i] > EMA_FAST[i]
+            + giá đóng cửa nến trước C[i-1] <= EMA_FAST[i-1]
+            + C[i] > EMA_SLOW[i]  (tránh long khi giá dưới ema200)
 
-    2) Chỉ trade khi trend giữ được ít nhất min_trend_bars.
+    - Xu hướng DOWN: EMA_FAST < EMA_SLOW
+        SHORT khi:
+            + C[i] < EMA_FAST[i]
+            + C[i-1] >= EMA_FAST[i-1]
+            + C[i] < EMA_SLOW[i]
 
-    3) Trong trend:
-        - Uptrend:
-            * Theo dõi swing_high (đỉnh mới nhất của sóng tăng).
-            * Pullback bắt đầu khi nến đóng dưới EMA nhanh (close < ema_fast).
-            * Trong pullback, theo dõi:
-                - pb_low  : đáy thấp nhất của pullback
-                - pb_high : đỉnh cao nhất (để tham chiếu)
-                - pb_bars : số nến pullback
-            * Điều kiện entry:
-                - pb_bars ∈ [min_pullback_bars, max_pullback_bars]
-                - Độ sâu pullback (swing_high - pb_low)/ATR trong
-                  [min_pullback_depth_atr, max_pullback_depth_atr]
-                - Nến tín hiệu đóng lại phía trên EMA nhanh
-                  (close > ema_fast, và low <= ema_fast để đảm bảo có chạm/tiếp cận EMA)
-                - Entry không cách EMA nhanh quá max_entry_distance_from_ema_atr * ATR
-                - SL = pb_low - buffer (buffer = atr_buffer_mult * ATR nếu bật)
-                - TP = entry + R * (entry - SL)
-
-        - Downtrend: mirror logic ngược lại.
-
-    4) Sau khi tạo 1 entry, pullback kết thúc; chờ Sóng mới (swing mới) & pullback tiếp theo.
+    SL = entry ± atr_mult_sl * ATR
+    TP = entry ± rr * (entry - SL)
     """
+    if i == 0:
+        return None
 
-    n = len(candles)
-    if n == 0:
-        return []
+    ema_fast = ema_fast_list[i]
+    ema_slow = ema_slow_list[i]
+    atr = atr_list[i]
 
-    signals: List[EntrySignal] = []
+    prev_ema_fast = ema_fast_list[i - 1]
+    prev_ema_slow = ema_slow_list[i - 1]
+    prev_atr = atr_list[i - 1]
 
-    current_trend: TrendSide = TrendSide.NONE
-    trend_bars: int = 0
-    swing_high_price: float | None = None
-    swing_low_price: float | None = None
+    # phải đủ dữ liệu indicator
+    if (
+        ema_fast is None or ema_slow is None or atr is None or
+        prev_ema_fast is None or prev_ema_slow is None or prev_atr is None
+    ):
+        return None
 
-    # pullback state
-    pullback_active: bool = False
-    pullback_start_index: int | None = None
-    pullback_high: float | None = None
-    pullback_low: float | None = None
-    pullback_bars: int = 0
-    pullback_count_in_trend: int = 0
+    c = candles[i]
+    prev_c = candles[i - 1]
 
-    def reset_pullback():
-        nonlocal pullback_active, pullback_start_index, pullback_high, pullback_low, pullback_bars
-        pullback_active = False
-        pullback_start_index = None
-        pullback_high = None
-        pullback_low = None
-        pullback_bars = 0
+    side: Optional[Side] = None
 
-    for i, c in enumerate(candles):
-        # 1) xác định trend hiện tại
-        bar_trend = _detect_trend(c, params)
+    # ===== LONG setup =====
+    if _is_trend_up(ema_fast, ema_slow):
+        if prev_c.close <= prev_ema_fast and c.close > ema_fast and c.close > ema_slow:
+            side = "LONG"
 
-        if bar_trend != current_trend:
-            # trend đổi (hoặc từ NONE sang UP/DOWN)
-            current_trend = bar_trend
-            if current_trend == TrendSide.NONE:
-                trend_bars = 0
-                swing_high_price = None
-                swing_low_price = None
-                pullback_count_in_trend = 0
-                reset_pullback()
-            else:
-                trend_bars = 1
-                swing_high_price = c.high
-                swing_low_price = c.low
-                pullback_count_in_trend = 0
-                reset_pullback()
-            # sang bar tiếp theo
-            continue
-        else:
-            # trend giữ nguyên
-            if current_trend == TrendSide.NONE:
-                # chưa có trend, bỏ qua
-                continue
-            trend_bars += 1
+    # ===== SHORT setup =====
+    elif _is_trend_down(ema_fast, ema_slow):
+        if prev_c.close >= prev_ema_fast and c.close < ema_fast and c.close < ema_slow:
+            side = "SHORT"
 
-        # 2) Chỉ bắt đầu logic pullback nếu trend đã đủ "chín"
-        if trend_bars < params.min_trend_bars:
-            # trong giai đoạn early trend, vẫn cập nhật swing cho đẹp
-            if current_trend == TrendSide.UP:
-                swing_high_price = max(swing_high_price, c.high) if swing_high_price is not None else c.high
-                swing_low_price = min(swing_low_price, c.low) if swing_low_price is not None else c.low
-            elif current_trend == TrendSide.DOWN:
-                swing_low_price = min(swing_low_price, c.low) if swing_low_price is not None else c.low
-                swing_high_price = max(swing_high_price, c.high) if swing_high_price is not None else c.high
-            continue
+    if side is None:
+        return None
 
-        # Nếu giới hạn số pullback mỗi trend
-        if params.max_pullbacks_per_trend > 0 and pullback_count_in_trend >= params.max_pullbacks_per_trend:
-            # Không nhận thêm tín hiệu mới trong trend này
-            # nhưng vẫn cập nhật swing cho có
-            if current_trend == TrendSide.UP:
-                swing_high_price = max(swing_high_price, c.high) if swing_high_price is not None else c.high
-            else:
-                swing_low_price = min(swing_low_price, c.low) if swing_low_price is not None else c.low
-            continue
+    if side == "LONG":
+        sl = c.close - params.atr_mult_sl * atr
+        risk_pts = c.close - sl
+        tp = c.close + params.rr * risk_pts
+    else:  # SHORT
+        sl = c.close + params.atr_mult_sl * atr
+        risk_pts = sl - c.close
+        tp = c.close - params.rr * risk_pts
 
-        # =====================
-        #   UP TREND LOGIC
-        # =====================
-        if current_trend == TrendSide.UP:
-            # Cập nhật swing high khi chưa có pullback
-            if not pullback_active:
-                if swing_high_price is None or c.high > swing_high_price:
-                    swing_high_price = c.high
-
-                # điều kiện bắt đầu pullback: nến đóng dưới EMA nhanh
-                if c.close < c.ema_fast:
-                    pullback_active = True
-                    pullback_start_index = i
-                    pullback_high = c.high
-                    pullback_low = c.low
-                    pullback_bars = 1
-                continue
-
-            # Đang trong pullback
-            pullback_bars += 1
-            pullback_high = max(pullback_high, c.high) if pullback_high is not None else c.high
-            pullback_low = min(pullback_low, c.low) if pullback_low is not None else c.low
-
-            # Nếu pullback quá dài -> bỏ, reset
-            if pullback_bars > params.max_pullback_bars:
-                reset_pullback()
-                continue
-
-            # Cần swing_high để đo độ sâu
-            if swing_high_price is None or c.atr <= 0:
-                continue
-
-            depth_atr = (swing_high_price - pullback_low) / c.atr  # luôn >= 0
-
-            # Nếu pullback quá sâu (deep correction) -> coi như trend yếu, bỏ
-            if depth_atr > params.max_pullback_depth_atr:
-                reset_pullback()
-                continue
-
-            # Điều kiện entry: nến đóng lại phía trên EMA nhanh
-            # và có dấu hiệu “quét qua” EMA (low <= ema_fast)
-            if (
-                c.close > c.ema_fast
-                and c.low <= c.ema_fast
-                and pullback_bars >= params.min_pullback_bars
-                and depth_atr >= params.min_pullback_depth_atr
-            ):
-                # Không cho entry quá xa EMA nhanh
-                dist_from_ema = abs(c.close - c.ema_fast)
-                if dist_from_ema > params.max_entry_distance_from_ema_atr * c.atr:
-                    # nến đóng quá xa EMA -> bỏ, reset pullback (coi như đã chạy rồi)
-                    reset_pullback()
-                    # cập nhật swing high mới từ nến breakout
-                    swing_high_price = c.high
-                    continue
-
-                entry_price = c.close
-                atr_here = c.atr
-                buffer = params.atr_buffer_mult * atr_here if params.use_atr_buffer else 0.0
-
-                # SL dưới đáy pullback (pb_low) trừ thêm buffer
-                sl = pullback_low - buffer
-                if sl >= entry_price:
-                    # trường hợp ATR quá nhỏ gây SL >= entry -> bỏ
-                    reset_pullback()
-                    swing_high_price = c.high
-                    continue
-
-                risk = entry_price - sl
-                tp = entry_price + params.r_mult * risk
-
-                signals.append(
-                    EntrySignal(
-                        index=i,
-                        side=Side.LONG,
-                        trend_side=TrendSide.UP,
-                        entry_price=entry_price,
-                        sl=sl,
-                        tp=tp,
-                        risk_pts=risk,
-                        rr=params.r_mult,
-                    )
-                )
-
-                pullback_count_in_trend += 1
-                # Sau khi breakout, coi nến hiện tại là swing high mới để đo pullback tiếp theo
-                swing_high_price = c.high
-                reset_pullback()
-                continue
-
-        # =====================
-        #   DOWN TREND LOGIC
-        # =====================
-        elif current_trend == TrendSide.DOWN:
-            # Cập nhật swing low khi chưa có pullback
-            if not pullback_active:
-                if swing_low_price is None or c.low < swing_low_price:
-                    swing_low_price = c.low
-
-                # Bắt đầu pullback khi nến đóng trên EMA nhanh (giá hồi lên)
-                if c.close > c.ema_fast:
-                    pullback_active = True
-                    pullback_start_index = i
-                    pullback_high = c.high
-                    pullback_low = c.low
-                    pullback_bars = 1
-                continue
-
-            # Đang trong pullback
-            pullback_bars += 1
-            pullback_high = max(pullback_high, c.high) if pullback_high is not None else c.high
-            pullback_low = min(pullback_low, c.low) if pullback_low is not None else c.low
-
-            if pullback_bars > params.max_pullback_bars:
-                reset_pullback()
-                continue
-
-            if swing_low_price is None or c.atr <= 0:
-                continue
-
-            depth_atr = (pullback_high - swing_low_price) / c.atr  # >= 0
-
-            if depth_atr > params.max_pullback_depth_atr:
-                reset_pullback()
-                continue
-
-            # Entry SHORT khi nến đóng lại dưới EMA nhanh & high >= ema_fast
-            if (
-                c.close < c.ema_fast
-                and c.high >= c.ema_fast
-                and pullback_bars >= params.min_pullback_bars
-                and depth_atr >= params.min_pullback_depth_atr
-            ):
-                dist_from_ema = abs(c.close - c.ema_fast)
-                if dist_from_ema > params.max_entry_distance_from_ema_atr * c.atr:
-                    # breakout quá xa EMA -> bỏ
-                    reset_pullback()
-                    swing_low_price = c.low
-                    continue
-
-                entry_price = c.close
-                atr_here = c.atr
-                buffer = params.atr_buffer_mult * atr_here if params.use_atr_buffer else 0.0
-
-                # SL trên đỉnh pullback + buffer
-                sl = pullback_high + buffer
-                if sl <= entry_price:
-                    reset_pullback()
-                    swing_low_price = c.low
-                    continue
-
-                risk = sl - entry_price
-                tp = entry_price - params.r_mult * risk
-
-                signals.append(
-                    EntrySignal(
-                        index=i,
-                        side=Side.SHORT,
-                        trend_side=TrendSide.DOWN,
-                        entry_price=entry_price,
-                        sl=sl,
-                        tp=tp,
-                        risk_pts=risk,
-                        rr=params.r_mult,
-                    )
-                )
-
-                pullback_count_in_trend += 1
-                swing_low_price = c.low
-                reset_pullback()
-                continue
-
-    return signals
+    return EmaPullbackEntry(
+        symbol=symbol,
+        index=i,
+        side=side,
+        entry_time=c.open_time,
+        entry_price=c.close,
+        sl=sl,
+        tp=tp,
+        risk_pts=risk_pts,
+        planned_rr=params.rr,
+        ema_fast=ema_fast,
+        ema_slow=ema_slow,
+        atr=atr,
+    )
