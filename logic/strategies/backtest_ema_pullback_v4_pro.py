@@ -5,92 +5,9 @@ from dataclasses import dataclass
 from typing import List, Optional, Tuple
 from datetime import datetime, timezone
 
-
-# ===========================
-# Cấu trúc Kline chuẩn
-# ===========================
-@dataclass
-class SimpleKline:
-    open_time: datetime
-    close_time: datetime
-    open: float
-    high: float
-    low: float
-    close: float
-
-
-# ===========================
-# Kết quả mô phỏng
-# ===========================
-@dataclass
-class TradeResult:
-    index: int
-    side: str
-    entry_time: datetime
-    exit_time: datetime
-    entry: float
-    sl: float
-    tp: float
-    exit_price: float
-    result_r: float   # R-multiple
-    atr: float
-
-
-# ===========================
-# PARAMS V4 PRO
-# ===========================
-@dataclass
-class BacktestParamsV4Pro:
-    ema_fast: int = 21
-    ema_slow: int = 200
-    atr_period: int = 14
-    r_multiple: float = 2.0
-
-    # Các filter bổ sung:
-    min_trend_strength: float = 0.0
-    max_pullback_ratio: float = 0.5
-
-
-# ===========================
-# EMA tính nhanh
-# ===========================
-def ema(values: List[float], period: int) -> List[float]:
-    if len(values) == 0:
-        return []
-
-    alpha = 2 / (period + 1)
-    out = [values[0]]
-
-    for v in values[1:]:
-        out.append(out[-1] + alpha * (v - out[-1]))
-    return out
-
-
-# ===========================
-# ATR tính nhanh
-# ===========================
-def compute_atr(kl: List[SimpleKline], length: int) -> List[float]:
-    out = [0.0] * len(kl)
-    if len(kl) < 2:
-        return out
-
-    trs = []
-    for i in range(1, len(kl)):
-        high = kl[i].high
-        low = kl[i].low
-        prev_close = kl[i - 1].close
-        tr = max(high - low, abs(high - prev_close), abs(low - prev_close))
-        trs.append(tr)
-
-    # Smooth ATR exponential
-    atr = []
-    alpha = 1 / length
-    atr.append(trs[0])
-    for t in trs[1:]:
-        atr.append(atr[-1] + alpha * (t - atr[-1]))
-
-    out[1:] = atr
-    return out
+from logic.indicators import ema, compute_atr
+from logic.models import SimpleKline, TradeResult
+from logic.strategies.v4_pro_params import EmaPullbackParams
 
 
 # ===========================
@@ -102,7 +19,7 @@ def detect_entry_v4(
     ema_fast: List[float],
     ema_slow: List[float],
     atr_list: List[float],
-    params: BacktestParamsV4Pro,
+    params: EmaPullbackParams,
 ) -> Optional[Tuple[str, float, float]]:
     """
     Return: (side, sl, tp)
@@ -144,7 +61,7 @@ def simulate_trade(
     sl: float,
     tp: float,
     candles: List[SimpleKline],
-    params: BacktestParamsV4Pro
+    params: EmaPullbackParams
 ) -> TradeResult:
 
     entry = candles[i].close
@@ -209,7 +126,7 @@ def simulate_trade(
 # ===========================
 def backtest_ema_pullback_v4_pro(
     klines,
-    params: BacktestParamsV4Pro,
+    params: EmaPullbackParams,
     symbol: str = "",
     interval: str = "",
 ):

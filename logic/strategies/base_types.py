@@ -1,23 +1,27 @@
 # logic/strategies/base_types.py
 
+from __future__ import annotations
 from dataclasses import dataclass
-from typing import Literal, Optional
+from enum import Enum
+from typing import Optional, Dict, Any
 
-from logic.strategies.ema_pullback_v4_pro import EmaPullbackParams
 
-RiskProfile = Literal["loose", "normal", "strict"]
+class RiskProfile(str, Enum):
+    CONSERVATIVE = "conservative"
+    MODERATE = "moderate"
+    AGGRESSIVE = "aggressive"
 
 
 @dataclass
 class StrategyUserOptions:
-    # Cho phép bật/tắt optimizer
-    use_optimizer: bool = False
+    """
+    Các option chung mà user có thể bật/tắt cho MỌI strategy.
+    Strategy cụ thể (như EMA Pullback V4 Pro) sẽ nhận object này
+    và tự diễn giải theo kiểu của nó.
+    """
+    use_optimizer: bool = False      # bật/tắt auto-optimizer theo symbol
+    strict_filters: bool = False     # bật/tắt filter chặt chẽ
+    risk_profile: RiskProfile = RiskProfile.MODERATE
 
-    # Chọn preset filter: không / vừa / chặt
-    filter_mode: Literal["none", "light", "pro"] = "light"
-
-    # Chọn mức độ rủi ro (sau này map ra R, SL, position sizing...)
-    risk_profile: RiskProfile = "normal"
-
-    # Cho phép user override luôn params (bỏ qua optimizer & preset)
-    override_params: Optional[EmaPullbackParams] = None
+    # chỗ này để dành mở rộng sau:
+    extra: Optional[Dict[str, Any]] = None

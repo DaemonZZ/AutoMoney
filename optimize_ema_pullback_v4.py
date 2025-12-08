@@ -1,28 +1,29 @@
-# optimize_ema_pullback_v4.py
+# test_compare_optimizer_v4_pro.py
 """
-Auto-optimizer cho EMA_PULLBACK_V4 Pro:
-- Lấy data futures multi-day cho từng symbol
-- Chạy grid search trên tập tham số (EMA / ATR / R)
-- Tính WR, Expectancy (R/trade)
-- In ra best params cho từng coin (và top 3 nếu muốn mở rộng)
+So sánh hiệu quả EMA_PULLBACK_V4_PRO:
+- Mode 1: Dùng params default (không optimizer)
+- Mode 2: Chạy Auto Optimizer rồi dùng bộ params tốt nhất
+
+In bảng:
+Symbol, Trades_base, WR_base, ExpR_base, Trades_opt, WR_opt, ExpR_opt, ΔExpR
 """
 
 from __future__ import annotations
-
-from dataclasses import dataclass
-from typing import List, Dict, Any
 from datetime import datetime, timedelta, timezone
+from typing import List, Any, Dict
 
-from api.market_data_futures import get_futures_klines  # dùng bản đang chạy OK với multi-coin
-from logic.strategies import (
-    ema_pullback_v4_pro,
-    BacktestParamsV4Pro,  # nếu tên class khác, đổi lại ở đây
+from api.market_data_futures import get_futures_klines
+from logic.strategies.backtest_ema_pullback_v4_pro import (
+    EmaPullbackParams,
+    TradeResult,
+    backtest_ema_pullback_v4_pro,
 )
+from logic.optimizer_v4_pro import optimize_v4_pro_for_symbol
 
 
-# ================== CẤU HÌNH CHUNG ==================
-
-# List coin cần optimize
+# ==============================
+# CONFIG
+# ==============================
 SYMBOLS = [
     "BTCUSDT",
     "ETHUSDT",
@@ -39,67 +40,61 @@ SYMBOLS = [
 ]
 
 INTERVAL = "5m"
-DAYS = 20  # số ngày history để optimize (20 ngày ~ 5760 nến 5m)
+DAYS = 20
+LIMIT_PER_CALL = 1000  # Binance max 1500/1000 tuỳ loại, 1000 cho an toàn
 
-# Grid tham số (anh có thể chỉnh cho rộng/hẹp hơn)
-EMA_FAST_LIST = [14, 18, 21]
-EMA_SLOW_LIST = [150, 200]
-ATR_LEN_LIST = [10, 14, 18]
-R_MULTIPLES = [1.8, 2.0, 2.2]
+# Default params V4 Pro (không optimizer)
+DEFAULT_PARAMS = EmaPullbackParams(
+    ema_fast=21,
+    ema_slow=200,
+    atr_period=14,
+    r_multiple=2.0,
+    min_trend_strength=0.0,
+    max_pullback_ratio=0.5,
+)
 
-# Ngưỡng lọc combo "chấp nhận được"
-MIN_TRADES = 250
-MIN_WR = 30.0  # %
 
-# ====================================================
-# Helper: convert interval string -> timedelta
-# ====================================================
-
-def _interval_to_timedelta(interval: str) -> timedelta:
-    """Chuyển chuỗi interval Binance ('5m','15m','1h','4h','1d',...) sang timedelta."""
+# ==============================
+# Helpers
+# ==============================
+def _interval_to_minutes(interval: str) -> int:
+    """Chuyển '5m', '15m'... -> số phút. Hiện tại chủ yếu dùng 5m."""
     unit = interval[-1]
-    value = int(interval[:-1])
-
+    val = int(interval[:-1])
     if unit == "m":
-        return timedelta(minutes=value)
-    if unit == "h":
-        return timedelta(hours=value)
-    if unit == "d":
-        return timedelta(days=value)
-    if unit == "w":
-        return timedelta(weeks=value)
+        return val
+    elif unit == "h":
+        return val * 60
+    elif unit == "d":
+        return val * 60 * 24
+    else:
+        raise ValueError(f"Unsupported interval: {interval}")
 
-    # fallback: coi như phút
-    return timedelta(minutes=value)
-
-
-# ====================================================
-# Helper: fetch multi-day futures klines (dùng datetime aware, không ms)
-# ====================================================
 
 def fetch_recent_futures_klines_by_days(
     symbol: str,
     interval: str,
     days: int,
-    limit_per_call: int = 1500,
+    limit_per_call: int = LIMIT_PER_CALL,
 ):
     """
-    Lấy toàn bộ klines trong N ngày gần nhất cho 1 symbol futures (UM).
-    Dùng get_futures_klines(symbol, interval, start_time, end_time, limit)
-    với start_time/end_time là datetime UTC.
+    Lấy nhiều ngày dữ liệu futures kline bằng cách gọi get_futures_klines nhiều lần.
+    Giả định get_futures_klines trả về list các object có:
+      - open_time: datetime (UTC)
+      - close_time: datetime
+      - open, high, low, close: float
     """
-    now_utc = datetime.now(timezone.utc)
-    end = now_utc
+    end = datetime.now(timezone.utc)
     start = end - timedelta(days=days)
+
+    all_klines: List[Any] = []
+    current_start = start
+    step_minutes = _interval_to_minutes(interval)
 
     print(
         f"[INFO] Fetching klines (multi-days) {symbol} {interval}, "
         f"from {start.isoformat()} to {end.isoformat()}"
     )
-
-    all_klines = []
-    current_start = start
-    interval_delta = _interval_to_timedelta(interval)
 
     while True:
         batch = get_futures_klines(
@@ -109,269 +104,153 @@ def fetch_recent_futures_klines_by_days(
             end_time=end,
             limit=limit_per_call,
         )
-
         if not batch:
             break
 
         all_klines.extend(batch)
 
-        # Nếu batch chưa đầy limit => hết data
-        if len(batch) < limit_per_call:
+        # Lấy open_time của cây nến cuối, tăng thêm 1 interval để tránh trùng
+        last_open = batch[-1].open_time
+        if last_open.tzinfo is None:
+            last_open = last_open.replace(tzinfo=timezone.utc)
+
+        current_start = last_open + timedelta(minutes=step_minutes)
+        if current_start >= end:
             break
 
-        # Lấy open_time của cây cuối cùng, cộng thêm 1 interval để tránh overlap
-        last_open = batch[-1].open_time  # giả định Kline có field open_time: datetime
-        next_start = last_open + interval_delta
-
-        if next_start >= end:
-            break
-
-        current_start = next_start
+        # Nếu số nến đã đủ về mặt lý thuyết thì thôi (optional)
+        # expected = days * 24 * 60 // step_minutes
+        # if len(all_klines) >= expected:
+        #     break
 
     print(f"[INFO] {symbol}: tổng số nến lấy được: {len(all_klines)}")
     return all_klines
 
 
-# ====================================================
-# Helper: đánh giá 1 bộ tham số
-# ====================================================
-
-@dataclass
-class BacktestStats:
-    trades: int
-    wins: int
-    loss: int
-    be: int
-    winrate: float
-    total_r: float
-    expectancy: float  # R/trade
-
-
-def evaluate_trades(trades) -> BacktestStats:
+def calc_stats_from_trades(trades: List[TradeResult]) -> Dict[str, float]:
     n = len(trades)
+    if n == 0:
+        return {
+            "trades": 0,
+            "wins": 0,
+            "loss": 0,
+            "be": 0,
+            "wr": 0.0,
+            "exp_r": -999.0,
+        }
+
     wins = sum(1 for t in trades if t.result_r > 0)
     loss = sum(1 for t in trades if t.result_r < 0)
-    be = sum(1 for t in trades if t.result_r == 0)
+    be = n - wins - loss
+
+    wr = wins / n * 100.0
     total_r = sum(t.result_r for t in trades)
-    winrate = (wins / n * 100.0) if n > 0 else 0.0
-    expectancy = (total_r / n) if n > 0 else 0.0
-
-    return BacktestStats(
-        trades=n,
-        wins=wins,
-        loss=loss,
-        be=be,
-        winrate=winrate,
-        total_r=total_r,
-        expectancy=expectancy,
-    )
-
-
-# ====================================================
-# Helper: tạo params V4 Pro
-# ====================================================
-
-def make_params(
-    ema_fast_len: int,
-    ema_slow_len: int,
-    atr_len: int,
-    r_multiple: float,
-) -> BacktestParamsV4Pro:
-    """
-    Chỉ override những field anh muốn grid search.
-    Các field khác dùng default trong EmaPullbackParams V4 Pro.
-    Nếu V4 Pro của anh yêu cầu field bắt buộc khác, thêm vào đây.
-    """
-    return BacktestParamsV4Pro(
-        ema_fast_len=ema_fast_len,
-        ema_slow_len=ema_slow_len,
-        atr_len=atr_len,
-        r_multiple=r_multiple,
-        # ví dụ nếu V4 Pro có thêm:
-        # min_trend_slope=0.05,
-        # min_body_factor=0.25,
-        # max_wick_ratio=0.6,
-        # ...
-    )
-
-
-# ====================================================
-# Optimize cho 1 symbol
-# ====================================================
-
-def optimize_symbol(symbol: str, klines) -> Dict[str, Any]:
-    """
-    Chạy grid search trên bộ tham số, trả về best combo cho 1 symbol.
-    """
-    print(f"\n========== OPTIMIZE {symbol} ==========")
-
-    best_any: Dict[str, Any] | None = None   # best không ràng buộc
-    best_filtered: Dict[str, Any] | None = None  # best có ràng buộc (MIN_TRADES, MIN_WR)
-
-    total_combos = (
-        len(EMA_FAST_LIST) * len(EMA_SLOW_LIST) *
-        len(ATR_LEN_LIST) * len(R_MULTIPLES)
-    )
-    combo_idx = 0
-
-    for ema_fast in EMA_FAST_LIST:
-        for ema_slow in EMA_SLOW_LIST:
-            # tránh EMA chồng quá gần
-            if ema_slow <= ema_fast + 20:
-                continue
-
-            for atr_len in ATR_LEN_LIST:
-                for r_mult in R_MULTIPLES:
-                    combo_idx += 1
-                    print(
-                        f"[{symbol}] Combo {combo_idx}/{total_combos}: "
-                        f"EMA_FAST={ema_fast}, EMA_SLOW={ema_slow}, "
-                        f"ATR={atr_len}, R={r_mult:.2f}"
-                    )
-
-                    params = make_params(
-                        ema_fast_len=ema_fast,
-                        ema_slow_len=ema_slow,
-                        atr_len=atr_len,
-                        r_multiple=r_mult,
-                    )
-
-                    try:
-                        trades, *_ = backtest_ema_pullback_v4_pro(klines, params)
-                    except Exception as e:
-                        print(f"[WARN] Lỗi backtest combo này: {e}")
-                        continue
-
-                    stats = evaluate_trades(trades)
-
-                    print(
-                        f"    -> trades={stats.trades}, WR={stats.winrate:.2f}%, "
-                        f"Exp={stats.expectancy:.3f}R, total_R={stats.total_r:.1f}"
-                    )
-
-                    combo_info = {
-                        "ema_fast": ema_fast,
-                        "ema_slow": ema_slow,
-                        "atr_len": atr_len,
-                        "r_mult": r_mult,
-                        "stats": stats,
-                    }
-
-                    # Cập nhật best_any (không filter)
-                    if (best_any is None) or (
-                        stats.expectancy > best_any["stats"].expectancy
-                    ):
-                        best_any = combo_info
-
-                    # Áp điều kiện lọc combo "hợp lý"
-                    if (
-                        stats.trades >= MIN_TRADES
-                        and stats.winrate >= MIN_WR
-                    ):
-                        if (best_filtered is None) or (
-                            stats.expectancy > best_filtered["stats"].expectancy
-                        ):
-                            best_filtered = combo_info
-
-    print(f"\n----- KẾT QUẢ {symbol} -----")
-
-    if best_filtered is not None:
-        s = best_filtered["stats"]
-        print("[BEST (filtered)] Ưu tiên ExpR, có MIN_TRADES & MIN_WR:")
-        print(
-            f"  EMA_FAST={best_filtered['ema_fast']}, "
-            f"EMA_SLOW={best_filtered['ema_slow']}, "
-            f"ATR={best_filtered['atr_len']}, "
-            f"R={best_filtered['r_mult']:.2f}"
-        )
-        print(
-            f"  Trades={s.trades}, Wins={s.wins}, Loss={s.loss}, BE={s.be}, "
-            f"WR={s.winrate:.2f}%, Exp={s.expectancy:.3f}R, total_R={s.total_r:.1f}"
-        )
-    else:
-        print("[BEST (filtered)] Không có combo nào đạt MIN_TRADES & MIN_WR.")
-
-    if best_any is not None:
-        s = best_any["stats"]
-        print("\n[ BEST (ANY) ] Chỉ tối đa hóa expectancy, không lọc:")
-        print(
-            f"  EMA_FAST={best_any['ema_fast']}, "
-            f"EMA_SLOW={best_any['ema_slow']}, "
-            f"ATR={best_any['atr_len']}, "
-            f"R={best_any['r_mult']:.2f}"
-        )
-        print(
-            f"  Trades={s.trades}, Wins={s.wins}, Loss={s.loss}, BE={s.be}, "
-            f"WR={s.winrate:.2f}%, Exp={s.expectancy:.3f}R, total_R={s.total_r:.1f}"
-        )
-    else:
-        print("[BEST (ANY)] Không backtest được combo nào?!")
+    exp_r = total_r / n
 
     return {
-        "symbol": symbol,
-        "best_filtered": best_filtered,
-        "best_any": best_any,
+        "trades": n,
+        "wins": wins,
+        "loss": loss,
+        "be": be,
+        "wr": wr,
+        "exp_r": exp_r,
     }
 
 
-# ====================================================
-# MAIN
-# ====================================================
-
+# ==============================
+# MAIN TEST
+# ==============================
 def main():
-    print("=== EMA_PULLBACK_V4 Pro - Auto Optimizer ===")
-    print(f"Symbols: {', '.join(SYMBOLS)}")
-    print(f"Interval: {INTERVAL}, Days: {DAYS}")
-    print(
-        f"Grid: EMA_FAST={EMA_FAST_LIST}, EMA_SLOW={EMA_SLOW_LIST}, "
-        f"ATR_LEN={ATR_LEN_LIST}, R_MULT={R_MULTIPLES}"
-    )
-    print(
-        f"Filter: MIN_TRADES={MIN_TRADES}, MIN_WR={MIN_WR:.1f}%\n"
-    )
-
-    all_results: List[Dict[str, Any]] = []
+    rows = []
 
     for idx, sym in enumerate(SYMBOLS, start=1):
         print(f"\n================ {idx}/{len(SYMBOLS)} - {sym} ================")
-        klines = fetch_recent_futures_klines_by_days(sym, INTERVAL, DAYS)
-        if not klines:
-            print(f"[WARN] Không có data cho {sym}, bỏ qua.")
-            continue
 
-        res = optimize_symbol(sym, klines)
-        all_results.append(res)
+        try:
+            klines = fetch_recent_futures_klines_by_days(sym, INTERVAL, DAYS)
+            if len(klines) < 100:
+                print(f"[WARN] {sym}: Dữ liệu quá ít, bỏ qua.")
+                continue
 
-    # Tổng kết nhanh best_filtered cho tất cả
-    print("\n\n===============================================")
-    print("         TỔNG KẾT BEST (FILTERED)             ")
-    print("===============================================")
-    print(
-        f"{'Symbol':<8} {'Efast':>5} {'Eslow':>5} {'ATR':>4} "
-        f"{'R':>4} {'Trd':>5} {'WR%':>6} {'ExpR':>7}"
+            # --------- 1. Backtest với params default (không optimizer) ---------
+            print(f"[BASE] Running backtest V4 Pro (NO optimizer) for {sym}...")
+            trades_base, *_ = backtest_ema_pullback_v4_pro(
+                klines=klines,
+                params=DEFAULT_PARAMS,
+                symbol=sym,
+                interval=INTERVAL,
+            )
+            stats_base = calc_stats_from_trades(trades_base)
+            print(
+                f"[BASE] {sym}: trades={stats_base['trades']}, "
+                f"WR={stats_base['wr']:.2f}%, ExpR={stats_base['exp_r']:.3f}"
+            )
+
+            # --------- 2. Optimizer ON: tìm best params ---------
+            print(f"[OPT] Running optimizer V4 Pro for {sym}...")
+            opt_result = optimize_v4_pro_for_symbol(
+                klines=klines,
+                symbol=sym,
+                interval=INTERVAL,
+                base_params=DEFAULT_PARAMS,
+                min_trades=200,
+            )
+
+            stats_opt = {
+                "trades": opt_result.trades,
+                "wins": opt_result.wins,
+                "loss": opt_result.loss,
+                "be": opt_result.be,
+                "wr": opt_result.winrate,
+                "exp_r": opt_result.exp_r,
+            }
+
+            print(
+                f"[OPT] {sym}: trades={stats_opt['trades']}, "
+                f"WR={stats_opt['wr']:.2f}%, ExpR={stats_opt['exp_r']:.3f}"
+            )
+
+            rows.append(
+                {
+                    "symbol": sym,
+                    "base_trades": stats_base["trades"],
+                    "base_wr": stats_base["wr"],
+                    "base_expr": stats_base["exp_r"],
+                    "opt_trades": stats_opt["trades"],
+                    "opt_wr": stats_opt["wr"],
+                    "opt_expr": stats_opt["exp_r"],
+                    "delta_expr": stats_opt["exp_r"] - stats_base["exp_r"],
+                }
+            )
+
+        except Exception as e:
+            print(f"[ERROR] Lỗi khi xử lý {sym}: {e}")
+
+    # =========================
+    # IN BẢNG SO SÁNH
+    # =========================
+    print("\n================================================")
+    print("        SO SÁNH V4 PRO: BASE vs OPTIMIZER       ")
+    print("================================================")
+    header = (
+        "Symbol   "
+        "BaseTrd  BaseWR%  BaseExpR   "
+        "OptTrd   OptWR%   OptExpR   ΔExpR"
     )
-    print("-" * 60)
+    print(header)
+    print("-" * len(header))
 
-    for res in all_results:
-        sym = res["symbol"]
-        bf = res["best_filtered"]
-        if bf is None:
-            print(f"{sym:<8} {'-':>5} {'-':>5} {'-':>4} {'-':>4} {'-':>5} {'-':>6} {'-':>7}")
-            continue
-
-        s = bf["stats"]
+    for r in rows:
         print(
-            f"{sym:<8} "
-            f"{bf['ema_fast']:>5d} "
-            f"{bf['ema_slow']:>5d} "
-            f"{bf['atr_len']:>4d} "
-            f"{bf['r_mult']:>4.1f} "
-            f"{s.trades:>5d} "
-            f"{s.winrate:>6.2f} "
-            f"{s.expectancy:>7.3f}"
+            f"{r['symbol']:<8} "
+            f"{r['base_trades']:>7}  "
+            f"{r['base_wr']:>7.2f}  "
+            f"{r['base_expr']:>8.3f}   "
+            f"{r['opt_trades']:>7}  "
+            f"{r['opt_wr']:>7.2f}  "
+            f"{r['opt_expr']:>8.3f}  "
+            f"{r['delta_expr']:>6.3f}"
         )
-
-    print("\nHoàn tất tối ưu.")
 
 
 if __name__ == "__main__":

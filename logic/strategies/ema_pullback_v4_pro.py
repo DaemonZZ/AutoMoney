@@ -6,27 +6,7 @@ from typing import List, Optional, Sequence, Tuple
 
 from logic.models import SimpleKline, TradeResult, Side
 from logic.indicators import ema, compute_atr
-from .base_types import StrategyUserOptions, RiskProfile
-
-
-# ===========================
-# PARAMS V4 PRO
-# ===========================
-@dataclass
-class EmaPullbackParams:
-    ema_fast: int = 18
-    ema_slow: int = 200
-    atr_period: int = 10
-    r_multiple: float = 2.2
-
-    # Các filter mở rộng (hiện tại min_trend_strength mới được dùng)
-    min_trend_strength: float = 0.0   # |EMA_fast - EMA_slow| tối thiểu
-    max_pullback_ratio: float = 0.5   # để dành, chưa dùng
-
-
-# Alias cho tương thích code cũ (nếu anh vẫn dùng tên BacktestParamsV4Pro)
-BacktestParamsV4Pro = EmaPullbackParams
-
+from logic.strategies.base_types import StrategyUserOptions
 
 # ===========================
 # DETECT ENTRY – EMA Pullback V4 Pro
