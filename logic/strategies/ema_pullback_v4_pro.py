@@ -7,6 +7,8 @@ from typing import List, Optional, Sequence, Tuple
 from logic.models import SimpleKline, TradeResult, Side
 from logic.indicators import ema, compute_atr
 from logic.strategies.base_types import StrategyUserOptions
+from logic.strategies.v4_pro_params import EmaPullbackParams
+
 
 # ===========================
 # DETECT ENTRY – EMA Pullback V4 Pro

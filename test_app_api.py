@@ -32,7 +32,7 @@ from core.app_api import (
 )
 
 
-# Nếu anh muốn set params tay luôn thì import EmaPullbackParams
+# Nếu  muốn set params tay luôn thì import EmaPullbackParams
 # (nếu file này đặt ở logic/strategies/ema_pullback_v4_pro.py)
 try:
     from logic.strategies.ema_pullback_v4_pro import EmaPullbackParams
